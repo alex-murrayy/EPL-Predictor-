@@ -1,5 +1,6 @@
 # Load libraries for data manipulation and model training/evaluation
 import pandas as pd
+import difflib
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score 
 from sklearn.metrics import precision_score
@@ -137,3 +138,150 @@ merged = combined.merge(combined, left_on=["date", "new_team"], right_on=["date"
 # Filter for cases where home prediction is win (1) and opponent is not (0);
 # then inspect how often that corresponds to an actual win for the first team.
 merged[(merged["predicted_x"] == 1) & (merged["predicted_y"] == 0)]["actual_x"].value_counts()
+
+# --- On-demand single-match prediction helpers ---
+# Team name normalization for user input (handles abbreviations and variations)
+def _simplify_name(name: str) -> str:
+    s = name.lower().strip()
+    # Remove punctuation and collapse spaces
+    for ch in ",.-_/\\()'\"":
+        s = s.replace(ch, " ")
+    s = " ".join(s.split())
+    # Common suffix removal
+    for token in ["fc"]:
+        s = s.replace(f" {token}", "")
+    return s
+
+# Build canonical set from data
+_canonical_names = sorted(set(matches["team"].unique()) | set(matches["opponent"].unique()))
+_simplified_to_canonical = { _simplify_name(n): n for n in _canonical_names }
+
+# Handcrafted aliases → canonical names
+_alias_map = {
+    # Manchester United
+    "manchester united": "Manchester United",
+    "man united": "Manchester United",
+    "man utd": "Manchester United",
+    "manchester utd": "Manchester United",
+    "man u": "Manchester United",
+    # Manchester City
+    "manchester city": "Manchester City",
+    "man city": "Manchester City",
+    "man c": "Manchester City",
+    # Tottenham Hotspur
+    "tottenham": "Tottenham Hotspur",
+    "spurs": "Tottenham Hotspur",
+    # Wolverhampton Wanderers
+    "wolves": "Wolverhampton Wanderers",
+    # West Ham United
+    "west ham": "West Ham United",
+    # Newcastle United
+    "newcastle": "Newcastle United",
+    "newcastle utd": "Newcastle United",
+    # Brighton
+    "brighton": "Brighton and Hove Albion",
+}
+
+def canonicalize_team_name(user_input: str) -> str:
+    """Return canonical team name from dataset, tolerating common variants.
+
+    Strategy: alias lookup → exact simplified match → fuzzy match over known teams.
+    """
+    key = _simplify_name(user_input)
+    # 1) Alias table
+    if key in _alias_map:
+        return _alias_map[key]
+    # 2) Exact simplified match to a known team
+    if key in _simplified_to_canonical:
+        return _simplified_to_canonical[key]
+    # 3) Fuzzy match on simplified keys
+    choices = list(_simplified_to_canonical.keys())
+    match = difflib.get_close_matches(key, choices, n=1, cutoff=0.8)
+    if match:
+        return _simplified_to_canonical[match[0]]
+    # Fallback to original (will likely error later if unknown)
+    return user_input
+# Build code maps from the original encodings so we can encode new inputs consistently
+venue_cats = matches["venue"].astype("category").cat.categories
+venue_code_map = {cat: code for code, cat in enumerate(venue_cats)}
+
+opponent_cats = matches["opponent"].astype("category").cat.categories
+opponent_code_map = {cat: code for code, cat in enumerate(opponent_cats)}
+
+def get_latest_rolling_features(team_name: str) -> pd.Series:
+    """Return the most recent rolling feature vector for the given team."""
+    team_rows = matches_rolling[matches_rolling["team"] == team_name]
+    if team_rows.empty:
+        raise ValueError(f"No rolling data available for team: {team_name}")
+    latest = team_rows.sort_values("date").iloc[-1]
+    return latest[new_cols]
+
+def prepare_feature_row(team: str, opponent: str, venue: str, when_date: str | None = None) -> pd.DataFrame:
+    """Create a single-row DataFrame with engineered features for prediction.
+
+    - team/opponent: use original naming as in the CSV (mapping applied where useful)
+    - venue: one of {"Home", "Away"}
+    - when_date: optional ISO date (YYYY-MM-DD). If omitted, use the latest date in data.
+    """
+    # Normalize names from user input to the dataset's canonical names
+    # Do NOT apply the short-name mapping here; rolling features and encoders
+    # are built from canonical names present in the raw data.
+    norm_team = canonicalize_team_name(team)
+    norm_opp = canonicalize_team_name(opponent)
+
+    # Date, hour, weekday features
+    if when_date is None:
+        ref_date = matches["date"].max()
+    else:
+        ref_date = pd.to_datetime(when_date)
+    hour = 15  # typical kickoff fallback
+    day_code = int(pd.to_datetime(ref_date).dayofweek)
+
+    # Encode venue and opponent using learned category maps
+    if venue not in venue_code_map:
+        raise ValueError("venue must be either 'Home' or 'Away'")
+    venue_code_val = int(venue_code_map[venue])
+    if norm_opp not in opponent_code_map:
+        raise ValueError(f"Unknown opponent name: {opponent}")
+    opponent_code_val = int(opponent_code_map[norm_opp])
+
+    # Latest rolling stats for the selected team
+    rolling_vals = get_latest_rolling_features(norm_team)
+
+    # Compose the full feature vector expected by the model
+    data = {
+        "venue_code": [venue_code_val],
+        "opponent_code": [opponent_code_val],
+        "hour": [hour],
+        "day_code": [day_code],
+        **{col: [float(rolling_vals[col])] for col in new_cols},
+    }
+    return pd.DataFrame(data)
+
+def predict_match(team: str, opponent: str, venue: str, when_date: str | None = None) -> tuple[float, int]:
+    """Return (prob_team_win, predicted_label) for team vs opponent at venue on date.
+
+    predicted_label: 1 means team predicted to win, 0 otherwise.
+    """
+    features = prepare_feature_row(team, opponent, venue, when_date)
+    # Ensure columns order matches the training predictors
+    full_predictors = predictors + new_cols
+    X = features[full_predictors]
+    proba = rf.predict_proba(X)[0][1]
+    label = int(proba >= 0.5)
+    return float(proba), label
+
+if __name__ == "__main__":
+    # Optional interactive prediction flow
+    try:
+        use_cli = input("Make a prediction? (y/N): ").strip().lower() == "y"
+        if use_cli:
+            team_in = input("Team name: ").strip()
+            opp_in = input("Opponent name: ").strip()
+            venue_in = input("Venue (Home/Away): ").strip().title()
+            date_in = input("Date (YYYY-MM-DD) [optional]: ").strip() or None
+            prob, lbl = predict_match(team_in, opp_in, venue_in, date_in)
+            outcome = "Win" if lbl == 1 else "Not Win"
+            print(f"Prediction for {team_in} vs {opp_in} at {venue_in}: {outcome} (p_win={prob:.3f})")
+    except Exception as e:
+        print(f"Prediction error: {e}")
